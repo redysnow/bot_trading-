@@ -1,0 +1,171 @@
+# trading_strategy.py
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from math import sqrt
+import datetime
+
+# --- Utilitaires ---
+def ATR(df, n=14):
+    high = df['High']
+    low  = df['Low']
+    close = df['Close']
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def sharpe_ratio(returns, periods_per_year=252):
+    mean = returns.mean() * periods_per_year
+    vol  = returns.std() * sqrt(periods_per_year)
+    return (mean / vol) if vol != 0 else np.nan
+
+def max_drawdown(equity):
+    peak = equity.cummax()
+    dd = (equity - peak) / peak
+    return dd.min()
+
+def CAGR(equity, days):
+    total_return = equity.iloc[-1] / equity.iloc[0] - 1
+    years = days / 252.0
+    if years <= 0:
+        return np.nan
+    return (1 + total_return) ** (1/years) - 1
+
+# --- Strategy parameters (tune these) ---
+SYMBOL = "AAPL"
+START = "2018-01-01"
+END   = datetime.date.today().isoformat()
+FAST_EMA = 20
+SLOW_EMA = 100
+ATR_PERIOD = 14
+ATR_STOP_MULT = 1.5       # stop loss distance = ATR * this
+RISK_PER_TRADE = 0.01     # fraction of account risked per trade (1%)
+KELLY_FRACTION = 0.5      # fraction of Kelly to use (0 = none, 1 = full Kelly)
+INITIAL_CAPITAL = 100000
+
+# --- Download data ---
+df = yf.download(SYMBOL, start=START, end=END, progress=False)
+df.dropna(inplace=True)
+
+# --- Indicators ---
+df['ema_fast'] = df['Close'].ewm(span=FAST_EMA, adjust=False).mean()
+df['ema_slow'] = df['Close'].ewm(span=SLOW_EMA, adjust=False).mean()
+df['atr'] = ATR(df, n=ATR_PERIOD)
+df.dropna(inplace=True)
+
+# --- Signals: long when fast ema crosses above slow ema AND volatility not too high (filter) ---
+df['signal'] = 0
+df.loc[df['ema_fast'] > df['ema_slow'], 'signal'] = 1
+df['signal'] = df['signal'].diff().fillna(0)  # 1 = entry, -1 = exit (but we only go long here)
+
+# --- Backtest loop (discrete trades) ---
+capital = INITIAL_CAPITAL
+equity_curve = []
+positions = []  # track open position dicts
+trade_log = []
+
+# For (very) simple estimated winrate for Kelly: use rolling expectancy (here we estimate from historical trades).
+# We'll compute Kelly fraction later from empirical winrate and avg win/loss once we have some trades.
+# But for first trades, we use RISK_PER_TRADE.
+
+position = None  # dict: {'entry_price', 'size', 'stop', 'entry_index'}
+for i in range(len(df)):
+    date = df.index[i]
+    row = df.iloc[i]
+    price = row['Close']
+    atr = row['atr']
+    signal = row['signal']
+
+    # Check existing position for stop or take profit
+    if position is not None:
+        # stop if price <= stop (we're long)
+        if price <= position['stop']:
+            pnl = (price - position['entry_price']) * position['size']
+            capital += pnl
+            trade_log.append({'entry_date': position['entry_date'],
+                              'exit_date': date,
+                              'entry_price': position['entry_price'],
+                              'exit_price': price,
+                              'size': position['size'],
+                              'pnl': pnl})
+            position = None
+
+    # Entry rule: signal == 1 and no existing position
+    if signal == 1 and position is None:
+        # Compute stop distance and position size using ATR-based sizing
+        stop_distance = ATR_STOP_MULT * atr
+        if stop_distance <= 0 or np.isnan(stop_distance):
+            continue
+        risk_amount = capital * RISK_PER_TRADE  # default risk per trade
+        size = risk_amount / stop_distance   # number of shares (float). We allow fractional for simplicity.
+        # Optionally adjust by Kelly if we have historical winrate estimates
+        if len(trade_log) >= 10:
+            # estimate winrate and avg win/loss
+            wins = [t['pnl'] for t in trade_log if t['pnl'] > 0]
+            losses = [-t['pnl'] for t in trade_log if t['pnl'] <= 0]
+            if len(wins) + len(losses) > 0 and np.mean(losses) > 0:
+                W = len(wins) / (len(wins)+len(losses))
+                R = (np.mean(wins) / np.mean(losses)) if np.mean(losses) != 0 else 1.0
+                # Kelly (fraction for betting fraction of capital): f = W - (1-W)/R
+                f_kelly = max(0.0, W - (1 - W) / R)
+                f_kelly = KELLY_FRACTION * f_kelly
+                # convert f_kelly to dollar risk target
+                if f_kelly > 0:
+                    risk_amount = capital * f_kelly
+                    size = risk_amount / stop_distance
+
+        # constrain size to reasonable number
+        size = max(0, size)
+        # enforce minimum notional exposure (e.g., at least one share)
+        if size * price < 1:
+            # too small, skip trade
+            pass
+        else:
+            position = {
+                'entry_date': date,
+                'entry_price': price,
+                'size': size,
+                'stop': price - stop_distance
+            }
+
+    # record equity mark-to-market
+    mtm = capital
+    if position is not None:
+        mtm += (price - position['entry_price']) * position['size']
+    equity_curve.append({'Date': date, 'Equity': mtm})
+
+# Close any open position at final price
+if position is not None:
+    final_price = df['Close'].iloc[-1]
+    pnl = (final_price - position['entry_price']) * position['size']
+    capital += pnl
+    trade_log.append({'entry_date': position['entry_date'],
+                      'exit_date': df.index[-1],
+                      'entry_price': position['entry_price'],
+                      'exit_price': final_price,
+                      'size': position['size'],
+                      'pnl': pnl})
+    position = None
+
+# --- Results & metrics ---
+eq_df = pd.DataFrame(equity_curve).set_index('Date')
+tot_days = (eq_df.index[-1] - eq_df.index[0]).days
+cagr = CAGR(eq_df['Equity'], tot_days)
+returns = eq_df['Equity'].pct_change().fillna(0)
+sr = sharpe_ratio(returns)
+mdd = max_drawdown(eq_df['Equity'])
+
+print(f"Initial capital: {INITIAL_CAPITAL}")
+print(f"Final equity: {capital:.2f}")
+print(f"CAGR: {cagr:.2%}")
+print(f"Sharpe (ann): {sr:.2f}")
+print(f"Max Drawdown: {mdd:.2%}")
+print(f"Number of trades: {len(trade_log)}")
+
+# Optional: export trade log
+trade_log_df = pd.DataFrame(trade_log)
+trade_log_df.to_csv("trade_log.csv", index=False)
+eq_df.to_csv("equity_curve.csv")
